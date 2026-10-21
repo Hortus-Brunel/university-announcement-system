@@ -135,6 +135,17 @@ const ANNOUNCEMENT_INCLUDE = {
 };
 
 /**
+ * Reusable Prisma filter: exclude announcements whose expiresAt has passed.
+ * An announcement with expiresAt = null never expires.
+ */
+const NOT_EXPIRED = {
+  OR: [
+    { expiresAt: null },
+    { expiresAt: { gt: new Date() } },
+  ],
+};
+
+/**
  * Create a new announcement.
  * L1 reps (class/club) publish immediately without approval.
  * L2+ also publish immediately — authorized publishers do not need approval.
@@ -203,6 +214,7 @@ async function getMyAnnouncements(user, { page = 1, limit = 20, search, category
   const where = {
     targets: audienceFilter,
     status: status || 'published', // Default: only published
+    ...NOT_EXPIRED,               // ← Never return expired records to client
     ...(categoryId && { categoryId }),
     ...(search && {
       OR: [
@@ -229,10 +241,13 @@ async function getMyAnnouncements(user, { page = 1, limit = 20, search, category
 /**
  * Get all announcements (admin: filter by status, author, etc.).
  */
-async function listAllAnnouncements({ page = 1, limit = 20, search, categoryId, status, authorId, scope } = {}) {
+async function listAllAnnouncements({ page = 1, limit = 20, search, categoryId, status, authorId, scope, includeExpired = false } = {}) {
   const skip = (page - 1) * limit;
 
   const where = {
+    // Admins can pass includeExpired=true to see expired posts in the dashboard;
+    // by default expired posts are excluded even from admin views.
+    ...(!includeExpired && NOT_EXPIRED),
     ...(status && { status }),
     ...(categoryId && { categoryId }),
     ...(authorId && { authorId }),
@@ -270,9 +285,17 @@ async function getAnnouncementById(announcementId, user) {
 
   if (!announcement) throw Object.assign(new Error('Announcement not found.'), { statusCode: 404 });
 
-  // Non-admins can only see published announcements
+  // Block access to expired announcements for non-admins
   const userLevel = LEVEL_ORDER[user.accessLevel] ?? 0;
-  if (userLevel < LEVEL_ORDER['L2_DEPT_ADMIN'] && announcement.status !== 'published') {
+  const isAdmin = userLevel >= LEVEL_ORDER['L2_DEPT_ADMIN'];
+  const isExpired = announcement.expiresAt && announcement.expiresAt <= new Date();
+
+  if (isExpired && !isAdmin) {
+    throw Object.assign(new Error('Announcement not found.'), { statusCode: 404 });
+  }
+
+  // Non-admins can only see published announcements
+  if (!isAdmin && announcement.status !== 'published') {
     // Only the author can see their own non-published announcements
     if (announcement.authorId !== user.id) {
       throw Object.assign(new Error('Announcement not found.'), { statusCode: 404 });
@@ -693,6 +716,52 @@ async function deleteComment(commentId, userId, userLevel) {
   await prisma.comment.delete({ where: { id: commentId } });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Expiry Purge Job
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Hard-delete all announcements whose expiresAt has passed.
+ * Cascade deletes handle targets, attachments, bookmarks, notifications,
+ * reactions and comments automatically (defined in Prisma schema).
+ *
+ * Called by the scheduler in server.js — runs daily at midnight.
+ * Returns the number of records permanently removed.
+ */
+async function purgeExpiredAnnouncements() {
+  const now = new Date();
+
+  // Collect IDs first so we can log them
+  const expired = await prisma.announcement.findMany({
+    where: { expiresAt: { lte: now } },
+    select: { id: true, title: true, expiresAt: true },
+  });
+
+  if (expired.length === 0) {
+    logger.info('[Purge] No expired announcements to remove.');
+    return 0;
+  }
+
+  const expiredIds = expired.map((a) => a.id);
+
+  // Delete in dependency order to respect FK constraints
+  // (Prisma cascade handles most, but explicit ordering is safer)
+  await prisma.reaction.deleteMany({ where: { announcementId: { in: expiredIds } } });
+  await prisma.comment.deleteMany({ where: { announcementId: { in: expiredIds } } });
+  await prisma.bookmark.deleteMany({ where: { announcementId: { in: expiredIds } } });
+  await prisma.notification.deleteMany({ where: { announcementId: { in: expiredIds } } });
+  await prisma.attachment.deleteMany({ where: { announcementId: { in: expiredIds } } });
+  await prisma.announcementTarget.deleteMany({ where: { announcementId: { in: expiredIds } } });
+  const { count } = await prisma.announcement.deleteMany({ where: { id: { in: expiredIds } } });
+
+  logger.info(`[Purge] Permanently deleted ${count} expired announcement(s) from the database.`);
+  for (const a of expired) {
+    logger.info(`[Purge]   - "${a.title}" (expired: ${a.expiresAt.toISOString()})`);
+  }
+
+  return count;
+}
+
 module.exports = {
   createAnnouncement,
   getMyAnnouncements,
@@ -711,4 +780,5 @@ module.exports = {
   createComment,
   getComments,
   deleteComment,
+  purgeExpiredAnnouncements,
 };

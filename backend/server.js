@@ -8,6 +8,7 @@ const path = require('path');
 
 const logger = require('./config/logger');
 const errorHandler = require('./middlewares/errorHandler');
+const { purgeExpiredAnnouncements } = require('./services/announcementService');
 
 // Route imports
 const authRoutes = require('./routes/authRoutes');
@@ -24,7 +25,6 @@ app.use(helmet());
 
 const configuredOrigins = [
   process.env.CLIENT_ORIGIN,
-  process.env.FRONTEND_URL,
   'http://localhost:5173',
   'http://localhost:3000',
   'http://localhost:5000'
@@ -34,13 +34,7 @@ app.use(cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
     const sanitized = origin.replace(/\/$/, '');
-    if (
-      configuredOrigins.includes(sanitized) ||
-      configuredOrigins.includes('*') ||
-      sanitized.endsWith('.vercel.app') ||
-      sanitized.endsWith('.onrender.com') ||
-      process.env.NODE_ENV !== 'production'
-    ) {
+    if (configuredOrigins.includes(sanitized)) {
       return callback(null, true);
     }
     return callback(new Error(`CORS policy blocked request from ${origin}`));
@@ -117,6 +111,43 @@ const PORT = process.env.PORT || 5000;
 const server = app.listen(PORT, () => {
   logger.info(`UAIMS API running on port ${PORT} in ${process.env.NODE_ENV || 'development'} mode.`);
 });
+
+// ─── Daily expiry purge scheduler ────────────────────────────────────────────
+// Runs immediately on startup to clear any already-expired announcements,
+// then fires every night at midnight. Hard-deletes expired rows + all their
+// cascade data (targets, attachments, bookmarks, notifications, reactions,
+// comments) so they no longer occupy space in the database.
+function scheduleMidnightPurge() {
+  const now = new Date();
+  const midnight = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate() + 1, // next calendar day
+    0, 0, 0, 0         // 00:00:00.000
+  );
+  const msUntilMidnight = midnight - now;
+
+  setTimeout(() => {
+    purgeExpiredAnnouncements().catch((err) =>
+      logger.error('[Purge] Scheduled purge failed: %s', err.message)
+    );
+    // Re-schedule every 24 hours after the first midnight run
+    setInterval(() => {
+      purgeExpiredAnnouncements().catch((err) =>
+        logger.error('[Purge] Scheduled purge failed: %s', err.message)
+      );
+    }, 24 * 60 * 60 * 1000);
+  }, msUntilMidnight);
+
+  logger.info(
+    `[Purge] Expiry purge scheduled. Next run at midnight (in ~${Math.round(msUntilMidnight / 60000)} min).`
+  );
+}
+
+// Run once immediately on startup, then schedule nightly
+purgeExpiredAnnouncements()
+  .then(() => scheduleMidnightPurge())
+  .catch((err) => logger.error('[Purge] Startup purge failed: %s', err.message));
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
